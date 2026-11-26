@@ -1,0 +1,121 @@
+name: Build and verify DailyApp for Windows
+
+on:
+  push:
+    branches: ['2026-11-26']
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Publish self-contained WPF client
+        run: dotnet publish DailyApp.WPF/DailyApp.WPF/DailyApp.WPF.csproj -c Release -r win-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -p:PublishTrimmed=false -o out/client
+      - name: Open the packaged login window
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath "$PWD/out/client/DailyApp.WPF.exe" -WorkingDirectory "$PWD/out/client" -PassThru -WindowStyle Hidden
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(45)
+            do {
+              Start-Sleep -Milliseconds 500
+              $app.Refresh()
+              if ($app.HasExited) { throw "Client exited at startup with code $($app.ExitCode)." }
+            } while ($app.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($app.MainWindowHandle -eq 0) { throw 'The login window did not open.' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -InputObject $app }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-client
+          path: out/client
+          if-no-files-found: error
+          retention-days: 1
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: dailyapp-ci
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build and reload the distributable Docker image
+        run: |
+          set -euo pipefail
+          docker compose build api
+          docker save dailyapp-api:2026-11-26 | gzip -1 > dailyapp-api.tar.gz
+          docker image rm dailyapp-api:2026-11-26
+          docker load --input dailyapp-api.tar.gz
+      - name: Test a fresh database and persistence after restart
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f docker-compose.yml)
+          "${compose[@]}" up --no-build -d --wait --wait-timeout 300
+          base=http://127.0.0.1:33333
+          curl -fsS "$base/health/ready" | grep -q 'DailyApp ready'
+          curl -fsS "$base/swagger/v1/swagger.json" | jq -e '.paths["/api/Account/Reg"] != null'
+          password=$(openssl rand -hex 16)
+          account=$(jq -nc --arg pwd "$password" '{account:"release-check",name:"Release check",pwd:$pwd}')
+          curl -fsS --json "$account" "$base/api/Account/Reg" | jq -e '.resultCode == 1'
+          curl -fsS --get --data-urlencode account=release-check --data-urlencode "pwd=$password" "$base/api/Account/Login" | jq -e '.resultCode == 1'
+          curl -fsS --json '{"title":"persistence-check","content":"saved before restart"}' "$base/api/Memo/AddMomo" | jq -e '.resultCode == 1'
+          "${compose[@]}" down
+          "${compose[@]}" up --no-build -d --wait --wait-timeout 300
+          curl -fsS "$base/api/Memo/QueryMemo?title=persistence-check" | jq -e '.resultCode == 1 and .resultData[0].content == "saved before restart"'
+      - if: failure()
+        run: docker compose -f docker-compose.yml logs --tail=80 db-key db api
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: api-image
+          path: dailyapp-api.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [client, backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-client
+          path: bundle/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: api-image
+          path: bundle
+      - name: Package and publish the verified build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp docker-compose.yml README.md packaging/*.cmd bundle/
+          test -s bundle/client/DailyApp.WPF.exe
+          test -s bundle/dailyapp-api.tar.gz
+          zipname="DailyApp-Windows-x64-$GITHUB_REF_NAME.zip"
+          (cd bundle && zip -q -r "../$zipname" .)
+          unzip -tq "$zipname"
+          sha256sum "$zipname" > "$zipname.sha256"
+          tag="v${GITHUB_REF_NAME//-/.}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag already exists; its assets are preserved."
+            exit 0
+          fi
+          gh release create "$tag" "$zipname" "$zipname.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "DailyApp $GITHUB_REF_NAME" \
+            --notes '适用于 Windows x64。启动 Docker Desktop（Linux 容器模式），完整解压 DailyApp-Windows-x64 安装包，双击 Start-DailyApp.cmd。首次启动需要联网下载 SQL Server 镜像，数据库会自动初始化。'

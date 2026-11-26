@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!NuGet.Config
+!DailyApp.API/
+!DailyApp.API/DailyApp.API/
+!DailyApp.API/DailyApp.API/**
+**/[Bb]in
+**/[Oo]bj
+**/.vs
+**/*.user
+**/Properties/PublishProfiles

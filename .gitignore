@@ -1,0 +1,17 @@
+# Build outputs and local IDE settings
+**/[Bb]in/
+**/[Oo]bj/
+.vs/
+*.user
+*.suo
+
+# Local package caches
+.nuget/
+.docker-config/
+.appdata/
+**/Properties/PublishProfiles/
+*_wpftmp.csproj
+.env
+
+# Original archive files are not source artifacts
+*.rar
